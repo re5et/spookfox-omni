@@ -57,6 +57,19 @@ built-ins: `tabs', `history', `bookmarks', `top-sites', `closed'."
   "Maximum number of history entries to fetch in one call."
   :type 'integer)
 
+(defcustom spookfox-omni-history-predicate
+  #'spookfox-omni-history-default-predicate
+  "Function deciding whether a history candidate is kept.
+Called with the raw history plist (:title :url :visitCount
+:lastVisitTime); returning non-nil keeps the entry.  The default,
+`spookfox-omni-history-default-predicate', drops entries with empty
+titles -- downloads, redirect-source URLs, iframe loads, and most
+background requests all surface that way.  Set to `always' (or
+`identity') to keep everything; supply your own function to filter
+further by URL pattern, visit count, etc."
+  :type '(choice (const :tag "Default: drop empty titles" spookfox-omni-history-default-predicate)
+                 (function :tag "Custom predicate")))
+
 (defcustom spookfox-omni-top-sites-limit 50
   "Maximum number of top sites to fetch in one call."
   :type 'integer)
@@ -175,14 +188,24 @@ See the commentary at the top of `spookfox-omni--' for the plist shape."
                                :pinned    (plist-get tab :pinned))))
           (spookfox-js-injection-eval (spookfox-omni--js-tabs))))
 
+(defun spookfox-omni-history-default-predicate (h)
+  "Default `spookfox-omni-history-predicate': drop empty-title items.
+H is the raw history plist (:title :url :visitCount :lastVisitTime).
+Empty titles are the strongest cheap signal that something isn't
+real navigation -- downloads, redirect-source URLs, and most
+background requests all surface that way."
+  (let ((title (plist-get h :title)))
+    (and title (not (string-empty-p title)))))
+
 (defun spookfox-omni--fetch-history ()
-  (mapcar (lambda (h)
-            (list :title (plist-get h :title)
-                  :url   (plist-get h :url)
-                  :extra (list :visits (plist-get h :visitCount)
-                               :last   (plist-get h :lastVisitTime))))
-          (spookfox-js-injection-eval
-           (spookfox-omni--js-history spookfox-omni-history-limit))))
+  (let ((raw (spookfox-js-injection-eval
+              (spookfox-omni--js-history spookfox-omni-history-limit))))
+    (mapcar (lambda (h)
+              (list :title (plist-get h :title)
+                    :url   (plist-get h :url)
+                    :extra (list :visits (plist-get h :visitCount)
+                                 :last   (plist-get h :lastVisitTime))))
+            (cl-remove-if-not spookfox-omni-history-predicate raw))))
 
 (defun spookfox-omni--fetch-bookmarks ()
   (mapcar (lambda (b)
