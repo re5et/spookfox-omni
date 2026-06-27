@@ -93,10 +93,20 @@ further by URL pattern, visit count, etc."
 ;; Source registry
 ;;
 ;; A source is a plist:
-;;   :label STRING    — short tag shown as the right-side annotation.
-;;   :fetch FUNCTION  — () -> list of candidate plists.
-;;   :open  FUNCTION  — (candidate) -> nil, optional; defaults to
-;;                      opening :url in a new tab.
+;;   :label     STRING   — short tag shown as the right-side annotation.
+;;   :js        STRING   — JS expression evaluated against the spookfox
+;;                or FUNCTION  background script.  When a function, it's
+;;                          called with no args and must return the JS.
+;;   :transform FUNCTION — (raw-eval-result) -> list of candidate plists.
+;;                          Required iff :js is provided.
+;;   :fetch     FUNCTION — () -> list of candidate plists.  Fallback for
+;;                          sources that aren't spookfox-backed; used iff
+;;                          :js is absent.  Not parallel-batchable.
+;;   :open      FUNCTION — (candidate) -> nil, optional; defaults to
+;;                          opening :url in a new tab.
+;;
+;; The picker prefers :js + :transform because all such sources can be
+;; fanned out into a single batch of parallel websocket round-trips.
 ;;
 ;; A candidate plist:
 ;;   :title STRING
@@ -173,20 +183,11 @@ See the commentary at the top of `spookfox-omni--' for the plist shape."
    limit))
 
 ;; ---------------------------------------------------------------------------
-;; Built-in source fetchers
+;; Transforms (raw JS result -> canonical candidate plists)
 ;;
-;; spookfox-js-injection returns plists with :keyword keys mirrored from the JS
-;; object keys.  Each fetcher normalises that to our canonical (:title :url
-;; :extra) shape.
-
-(defun spookfox-omni--fetch-tabs ()
-  (mapcar (lambda (tab)
-            (list :title (plist-get tab :title)
-                  :url   (plist-get tab :url)
-                  :extra (list :id        (plist-get tab :id)
-                               :window-id (plist-get tab :windowId)
-                               :pinned    (plist-get tab :pinned))))
-          (spookfox-js-injection-eval (spookfox-omni--js-tabs))))
+;; The addon hands plists back with :keyword keys mirrored from the JS object
+;; keys.  Each transform normalises that to our canonical (:title :url :extra)
+;; shape.
 
 (defun spookfox-omni-history-default-predicate (h)
   "Default `spookfox-omni-history-predicate': drop empty-title items.
@@ -197,36 +198,36 @@ background requests all surface that way."
   (let ((title (plist-get h :title)))
     (and title (not (string-empty-p title)))))
 
-(defun spookfox-omni--fetch-history ()
-  (let ((raw (spookfox-js-injection-eval
-              (spookfox-omni--js-history spookfox-omni-history-limit))))
-    (mapcar (lambda (h)
-              (list :title (plist-get h :title)
-                    :url   (plist-get h :url)
-                    :extra (list :visits (plist-get h :visitCount)
-                                 :last   (plist-get h :lastVisitTime))))
-            (cl-remove-if-not spookfox-omni-history-predicate raw))))
+(defun spookfox-omni--transform-tabs (raw)
+  (mapcar (lambda (tab)
+            (list :title (plist-get tab :title)
+                  :url   (plist-get tab :url)
+                  :extra (list :id        (plist-get tab :id)
+                               :window-id (plist-get tab :windowId)
+                               :pinned    (plist-get tab :pinned))))
+          raw))
 
-(defun spookfox-omni--fetch-bookmarks ()
+(defun spookfox-omni--transform-history (raw)
+  (mapcar (lambda (h)
+            (list :title (plist-get h :title)
+                  :url   (plist-get h :url)
+                  :extra (list :visits (plist-get h :visitCount)
+                               :last   (plist-get h :lastVisitTime))))
+          (cl-remove-if-not spookfox-omni-history-predicate raw)))
+
+(defun spookfox-omni--transform-bookmarks (raw)
   (mapcar (lambda (b)
             (list :title (plist-get b :title)
                   :url   (plist-get b :url)
                   :extra (list :parent (plist-get b :parent))))
-          (spookfox-js-injection-eval (spookfox-omni--js-bookmarks))))
+          raw))
 
-(defun spookfox-omni--fetch-top-sites ()
+(defun spookfox-omni--transform-flat (raw)
+  "Generic transform for sources whose raw items only need :title + :url."
   (mapcar (lambda (s)
             (list :title (plist-get s :title)
                   :url   (plist-get s :url)))
-          (spookfox-js-injection-eval
-           (spookfox-omni--js-top-sites spookfox-omni-top-sites-limit))))
-
-(defun spookfox-omni--fetch-closed ()
-  (mapcar (lambda (c)
-            (list :title (plist-get c :title)
-                  :url   (plist-get c :url)))
-          (spookfox-js-injection-eval
-           (spookfox-omni--js-closed spookfox-omni-closed-limit))))
+          raw))
 
 ;; ---------------------------------------------------------------------------
 ;; Actions
@@ -261,27 +262,42 @@ background requests all surface that way."
 
 ;; ---------------------------------------------------------------------------
 ;; Built-in source registrations
+;;
+;; Limits read from defcustoms at fetch time (hence :js as a function for the
+;; sources that interpolate them), so M-x customize takes effect without
+;; re-registering.
 
 (spookfox-omni-register-source
  'tabs       (list :label "tab"
-                   :fetch #'spookfox-omni--fetch-tabs
+                   :js    (spookfox-omni--js-tabs)
+                   :transform #'spookfox-omni--transform-tabs
                    :open  #'spookfox-omni--focus-tab))
 
 (spookfox-omni-register-source
  'history    (list :label "history"
-                   :fetch #'spookfox-omni--fetch-history))
+                   :js    (lambda ()
+                            (spookfox-omni--js-history
+                             spookfox-omni-history-limit))
+                   :transform #'spookfox-omni--transform-history))
 
 (spookfox-omni-register-source
  'bookmarks  (list :label "bookmark"
-                   :fetch #'spookfox-omni--fetch-bookmarks))
+                   :js    (spookfox-omni--js-bookmarks)
+                   :transform #'spookfox-omni--transform-bookmarks))
 
 (spookfox-omni-register-source
  'top-sites  (list :label "top"
-                   :fetch #'spookfox-omni--fetch-top-sites))
+                   :js    (lambda ()
+                            (spookfox-omni--js-top-sites
+                             spookfox-omni-top-sites-limit))
+                   :transform #'spookfox-omni--transform-flat))
 
 (spookfox-omni-register-source
  'closed     (list :label "closed"
-                   :fetch #'spookfox-omni--fetch-closed))
+                   :js    (lambda ()
+                            (spookfox-omni--js-closed
+                             spookfox-omni-closed-limit))
+                   :transform #'spookfox-omni--transform-flat))
 
 ;; ---------------------------------------------------------------------------
 ;; Free-form input detection
@@ -297,18 +313,71 @@ background requests all surface that way."
   (if (string-match-p "://" s) s (concat "https://" s)))
 
 ;; ---------------------------------------------------------------------------
-;; Gather + dedup
+;; Parallel fetch primitive
+;;
+;; spookfox-request is non-blocking: it sends the message and returns the
+;; request ID immediately, then a response handler stashes the result in
+;; `spookfox--responses' whenever it arrives.  By issuing every request
+;; first, *then* polling each ID, we let the addon's async handlers run
+;; concurrently — wall-clock collapses to roughly max(per-request) instead
+;; of sum(per-request).
+
+(defun spookfox-omni--source-js (src)
+  "Return the JS string for SRC, or nil if SRC uses :fetch instead."
+  (let ((js (plist-get src :js)))
+    (cond ((stringp   js) js)
+          ((functionp js) (funcall js)))))
+
+(defun spookfox-omni--js-eval-parallel (js-list)
+  "Eval each JS string in JS-LIST against the addon's background script.
+All sends are issued first, polls happen second; total wall-clock is
+roughly max(individual round-trips).  Returns results positionally
+matched to JS-LIST.  Returns nil if no spookfox client is connected."
+  (when-let* ((client (cl-first spookfox--connected-clients)))
+    (let* ((spookfox--msg-prefix "JS_INJECT_")
+           (ids (mapcar (lambda (js)
+                          (spookfox-request client "EVAL_IN_BACKGROUND_SCRIPT"
+                                            `((code . ,js))))
+                        js-list)))
+      (mapcar (lambda (id)
+                (plist-get (spookfox--poll-response id) :payload))
+              ids))))
+
+;; ---------------------------------------------------------------------------
+;; Gather
+
+(defun spookfox-omni--fetch-grouped (source-keys)
+  "Fetch candidates for each of SOURCE-KEYS; return alist (KEY . CANDS).
+Sources providing :js are batched into a single parallel round-trip;
+:fetch fallbacks run serially after.  Output preserves SOURCE-KEYS
+order.  No dedup."
+  (let* ((entries     (mapcar (lambda (k) (cons k (spookfox-omni--source k)))
+                              source-keys))
+         (js-entries  (cl-remove-if-not (lambda (e) (plist-get (cdr e) :js)) entries))
+         (raw-results (spookfox-omni--js-eval-parallel
+                       (mapcar (lambda (e) (spookfox-omni--source-js (cdr e)))
+                               js-entries)))
+         (results-by-key (make-hash-table :test 'eq)))
+    (cl-mapc (lambda (entry raw)
+               (puthash (car entry)
+                        (funcall (plist-get (cdr entry) :transform) raw)
+                        results-by-key))
+             js-entries raw-results)
+    (dolist (e entries)
+      (let ((key (car e)) (src (cdr e)))
+        (unless (gethash key results-by-key)
+          (puthash key (funcall (plist-get src :fetch)) results-by-key))))
+    (mapcar (lambda (key) (cons key (gethash key results-by-key)))
+            source-keys)))
 
 (defun spookfox-omni--gather (source-keys)
-  "Run :fetch on each of SOURCE-KEYS in order; return candidates.
-Tagged with :source SYM, deduped across sources by URL."
+  "Flat candidate list across SOURCE-KEYS, tagged with :source.
+Deduped by URL; earlier source wins."
   (let ((seen (make-hash-table :test 'equal))
         (acc  '()))
-    (dolist (key source-keys)
-      (let* ((src   (spookfox-omni--source key))
-             (fetch (plist-get src :fetch))
-             (cands (funcall fetch)))
-        (dolist (c cands)
+    (dolist (group (spookfox-omni--fetch-grouped source-keys))
+      (let ((key (car group)))
+        (dolist (c (cdr group))
           (let ((url (plist-get c :url)))
             (when (and url (not (gethash url seen)))
               (puthash url t seen)

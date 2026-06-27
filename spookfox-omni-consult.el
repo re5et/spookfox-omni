@@ -24,14 +24,14 @@
 (require 'consult)
 (require 'spookfox-omni)
 
-(defun spookfox-omni-consult--items (fetch)
-  "Turn FETCH's list of candidate plists into propertized strings.
+(defun spookfox-omni-consult--items (cands)
+  "Turn CANDS (list of candidate plists) into propertized strings.
 The original plist rides along on each string under the
 `spookfox-omni-cand' text property so the :action callback can
 recover it after consult returns just the display string."
   (let ((seen (make-hash-table :test 'equal))
         (out  nil))
-    (dolist (c (funcall fetch))
+    (dolist (c cands)
       (let* ((title (or (plist-get c :title) ""))
              (url   (or (plist-get c :url) ""))
              (disp  (if (string-empty-p title) url title))
@@ -64,18 +64,19 @@ preserves through its UI."
       (concat "  " (propertize (or url "") 'face 'completions-annotations)
               "  [" (propertize (or label "?") 'face 'completions-annotations) "]"))))
 
-(defun spookfox-omni-consult--source (key narrow)
+(defun spookfox-omni-consult--source (key narrow cands)
   "Build a `consult--multi' source plist for spookfox-omni source KEY.
-NARROW is the single-character narrowing key.
+NARROW is the single-character narrowing key.  CANDS is the
+already-fetched candidate list for this source (we pre-fetch all
+sources in parallel before building any consult sources, so each
+:items thunk is just a no-op closure over its slice).
 
-KEY and FETCH are closed over lexically so the :items thunk doesn't
-need to look them up at call time -- and so the :source tag actually
-gets KEY's value baked in (a backquote `,key' inside the lambda would
-*not* expand, because the outer backquote treats the substituted
+KEY is closed over lexically so the :source tag stamped on each
+candidate ends up as a real symbol (a backquoted `,key' inside the
+lambda would NOT expand — the outer backquote treats the substituted
 lambda as opaque data)."
-  (let* ((src    (spookfox-omni--source key))
-         (label  (plist-get src :label))
-         (fetch  (plist-get src :fetch)))
+  (let* ((src   (spookfox-omni--source key))
+         (label (plist-get src :label)))
     (list :name     (capitalize (or label (symbol-name key)))
           :category 'spookfox-omni
           :narrow   narrow
@@ -88,7 +89,7 @@ lambda as opaque data)."
                                               'spookfox-omni-cand
                                               (plist-put (copy-sequence cand)
                                                          :source key))))
-                              (spookfox-omni-consult--items fetch)))
+                              (spookfox-omni-consult--items cands)))
           :action   #'spookfox-omni-consult--action)))
 
 (defcustom spookfox-omni-consult-sources
@@ -105,16 +106,24 @@ Add `(top-sites . ?s)' / `(closed . ?c)' to opt in."
 ;;;###autoload
 (defun spookfox-omni-consult ()
   "Pick from Firefox sources via `consult--multi'.
-Narrowing keys per `spookfox-omni-consult-sources'."
+Narrowing keys per `spookfox-omni-consult-sources'.  All sources are
+pre-fetched in a single parallel batch, so the consult prompt opens
+in roughly max(per-source-round-trip) wall-clock time rather than
+the sum."
   (interactive)
-  (consult--multi
-   (mapcar (lambda (cell)
-             (spookfox-omni-consult--source (car cell) (cdr cell)))
-           spookfox-omni-consult-sources)
-   :prompt   "Firefox: "
-   :sort     nil
-   :require-match nil
-   :history  'spookfox-omni-consult--history))
+  (let* ((keys   (mapcar #'car spookfox-omni-consult-sources))
+         (groups (spookfox-omni--fetch-grouped keys)))
+    (consult--multi
+     (mapcar (lambda (cell)
+               (let* ((key    (car cell))
+                      (narrow (cdr cell))
+                      (cands  (cdr (assq key groups))))
+                 (spookfox-omni-consult--source key narrow cands)))
+             spookfox-omni-consult-sources)
+     :prompt   "Firefox: "
+     :sort     nil
+     :require-match nil
+     :history  'spookfox-omni-consult--history)))
 
 (provide 'spookfox-omni-consult)
 ;;; spookfox-omni-consult.el ends here
