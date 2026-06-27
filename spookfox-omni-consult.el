@@ -66,30 +66,39 @@ preserves through its UI."
 
 (defun spookfox-omni-consult--source (key narrow)
   "Build a `consult--multi' source plist for spookfox-omni source KEY.
-NARROW is the single-character narrowing key."
+NARROW is the single-character narrowing key.
+
+KEY and FETCH are closed over lexically so the :items thunk doesn't
+need to look them up at call time -- and so the :source tag actually
+gets KEY's value baked in (a backquote `,key' inside the lambda would
+*not* expand, because the outer backquote treats the substituted
+lambda as opaque data)."
   (let* ((src    (spookfox-omni--source key))
          (label  (plist-get src :label))
          (fetch  (plist-get src :fetch)))
-    `(:name     ,(capitalize (or label (symbol-name key)))
-      :category spookfox-omni
-      :narrow   ,narrow
-      :annotate spookfox-omni-consult--annotate
-      :items    ,(lambda ()
-                   (mapcar (lambda (s)
-                             (let ((cand (get-text-property 0 'spookfox-omni-cand s)))
-                               (propertize s
-                                           'spookfox-omni-cand
-                                           (plist-put (copy-sequence cand) :source ',key))))
-                           (spookfox-omni-consult--items fetch)))
-      :action   spookfox-omni-consult--action)))
+    (list :name     (capitalize (or label (symbol-name key)))
+          :category 'spookfox-omni
+          :narrow   narrow
+          :annotate #'spookfox-omni-consult--annotate
+          :items    (lambda ()
+                      (mapcar (lambda (s)
+                                (let ((cand (get-text-property
+                                             0 'spookfox-omni-cand s)))
+                                  (propertize s
+                                              'spookfox-omni-cand
+                                              (plist-put (copy-sequence cand)
+                                                         :source key))))
+                              (spookfox-omni-consult--items fetch)))
+          :action   #'spookfox-omni-consult--action)))
 
 (defcustom spookfox-omni-consult-sources
   '((tabs      . ?t)
     (history   . ?h)
-    (bookmarks . ?b)
-    (top-sites . ?s)
-    (closed    . ?c))
-  "Alist of (SOURCE-KEY . NARROW-CHAR) shown by `spookfox-omni-consult'."
+    (bookmarks . ?b))
+  "Alist of (SOURCE-KEY . NARROW-CHAR) shown by `spookfox-omni-consult'.
+Top-sites and closed are opt-in: they each cost one extra websocket
+round-trip per invocation and most people don't reach for them often.
+Add `(top-sites . ?s)' / `(closed . ?c)' to opt in."
   :type '(alist :key-type symbol :value-type character)
   :group 'spookfox-omni)
 
